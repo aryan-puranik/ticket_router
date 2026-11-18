@@ -198,3 +198,191 @@ class BPlusTree:
         self._height += 1
         return True
 
+    
+    def delete(self, key: Any) -> bool:
+        """Remove key. Returns True if it existed."""
+        path: List[Tuple[_Node, int]] = []
+        node = self._root
+        for _ in range(self._height - 1):
+            i = bisect_right(node.keys, key)
+            path.append((node, i))
+            node = node.children[i]
+        leaf: _Leaf = node
+        keys = leaf.keys
+        i = bisect_left(keys, key)
+        if i >= len(keys) or keys[i] != key:
+            return False
+        del keys[i]
+        del leaf.vals[i]
+        self._size -= 1
+        if path and len(keys) < self._min:
+            self._fix_leaf(leaf, path)
+        return True
+
+    def _fix_leaf(self, leaf: _Leaf, path: List[Tuple[_Node, int]]) -> None:
+        parent, idx = path.pop()
+        left = parent.children[idx - 1] if idx > 0 else None
+        right = parent.children[idx + 1] if idx + 1 < len(parent.children) else None
+
+        if left is not None and len(left.keys) > self._min:          # borrow from left
+            leaf.keys.insert(0, left.keys.pop())
+            leaf.vals.insert(0, left.vals.pop())
+            parent.keys[idx - 1] = leaf.keys[0]
+            return
+        if right is not None and len(right.keys) > self._min:        # borrow from right
+            leaf.keys.append(right.keys.pop(0))
+            leaf.vals.append(right.vals.pop(0))
+            parent.keys[idx] = right.keys[0]
+            return
+        if left is not None:                                         # merge into left
+            left.keys.extend(leaf.keys)
+            left.vals.extend(leaf.vals)
+            left.next = leaf.next
+            if leaf.next is not None:
+                leaf.next.prev = left
+            del parent.keys[idx - 1]
+            del parent.children[idx]
+        else:                                                        # merge right into leaf
+            leaf.keys.extend(right.keys)
+            leaf.vals.extend(right.vals)
+            leaf.next = right.next
+            if right.next is not None:
+                right.next.prev = leaf
+            del parent.keys[idx]
+            del parent.children[idx + 1]
+        self._fix_internal(parent, path)
+
+    def _fix_internal(self, node: _Node, path: List[Tuple[_Node, int]]) -> None:
+        while True:
+            if not path:                       # node is the root
+                if not node.keys:              # root lost its last separator -> shrink tree
+                    self._root = node.children[0]
+                    self._height -= 1
+                return
+            if len(node.keys) >= self._min:
+                return
+            parent, idx = path.pop()
+            left = parent.children[idx - 1] if idx > 0 else None
+            right = parent.children[idx + 1] if idx + 1 < len(parent.children) else None
+
+            if left is not None and len(left.keys) > self._min:      # rotate right
+                node.keys.insert(0, parent.keys[idx - 1])
+                node.children.insert(0, left.children.pop())
+                parent.keys[idx - 1] = left.keys.pop()
+                return
+            if right is not None and len(right.keys) > self._min:    # rotate left
+                node.keys.append(parent.keys[idx])
+                node.children.append(right.children.pop(0))
+                parent.keys[idx] = right.keys.pop(0)
+                return
+            if left is not None:                                     # merge node into left
+                left.keys.append(parent.keys[idx - 1])
+                left.keys.extend(node.keys)
+                left.children.extend(node.children)
+                del parent.keys[idx - 1]
+                del parent.children[idx]
+            else:                                                    # merge right into node
+                node.keys.append(parent.keys[idx])
+                node.keys.extend(right.keys)
+                node.children.extend(right.children)
+                del parent.keys[idx]
+                del parent.children[idx + 1]
+            node = parent
+
+    # ------------------------------------------------------------------ bulk load
+    def bulk_load(self, items: Iterable[Tuple[Any, Any]]) -> None:
+        """Build the tree bottom-up from (key, value) pairs sorted by strictly increasing key.
+        O(n) - far faster than n inserts, and nodes are packed evenly. Tree must be empty."""
+        if self._size:
+            raise ValueError("bulk_load requires an empty tree")
+        items = list(items)
+        n = len(items)
+        if n == 0:
+            return
+        for i in range(n - 1):
+            if not items[i][0] < items[i + 1][0]:
+                raise ValueError("bulk_load input must be strictly increasing by key")
+
+        n_leaves = -(-n // self._max)
+        base, extra = divmod(n, n_leaves)
+        level: List[Any] = []
+        prev: Optional[_Leaf] = None
+        pos = 0
+        for j in range(n_leaves):
+            size = base + (1 if j < extra else 0)
+            chunk = items[pos:pos + size]
+            pos += size
+            leaf = _Leaf()
+            leaf.keys = [k for k, _ in chunk]
+            leaf.vals = [v for _, v in chunk]
+            leaf.prev = prev
+            if prev is not None:
+                prev.next = leaf
+            prev = leaf
+            level.append(leaf)
+
+        firsts = [lf.keys[0] for lf in level]   # smallest key under each node of `level`
+        height = 1
+        fanout = self._max + 1
+        while len(level) > 1:
+            c = len(level)
+            n_par = -(-c // fanout)
+            base, extra = divmod(c, n_par)
+            parents: List[_Node] = []
+            parent_firsts: List[Any] = []
+            pos = 0
+            for j in range(n_par):
+                size = base + (1 if j < extra else 0)
+                node = _Node()
+                node.children = level[pos:pos + size]
+                node.keys = firsts[pos + 1:pos + size]
+                parent_firsts.append(firsts[pos])
+                parents.append(node)
+                pos += size
+            level, firsts = parents, parent_firsts
+            height += 1
+        self._root = level[0]
+        self._height = height
+        self._size = n
+
+    # ------------------------------------------------------------------ self-check (used by tests)
+    def check_invariants(self) -> None:
+        leaves: List[_Leaf] = []
+
+        def walk(node: Any, depth: int, lo: Any, hi: Any, is_root: bool) -> int:
+            ks = node.keys
+            if depth == self._height:
+                assert isinstance(node, _Leaf)
+                assert len(ks) == len(node.vals)
+                assert all(ks[i] < ks[i + 1] for i in range(len(ks) - 1))
+                if ks:
+                    if lo is not None:
+                        assert ks[0] >= lo
+                    if hi is not None:
+                        assert ks[-1] < hi
+                assert len(ks) <= self._max
+                if not is_root:
+                    assert len(ks) >= self._min
+                leaves.append(node)
+                return len(ks)
+            assert isinstance(node, _Node)
+            assert len(node.children) == len(ks) + 1
+            assert all(ks[i] < ks[i + 1] for i in range(len(ks) - 1))
+            assert len(ks) <= self._max
+            assert (len(ks) >= 1) if is_root else (len(ks) >= self._min)
+            total = 0
+            for i, ch in enumerate(node.children):
+                clo = lo if i == 0 else ks[i - 1]
+                chi = hi if i == len(ks) else ks[i]
+                total += walk(ch, depth + 1, clo, chi, False)
+            return total
+
+        total = walk(self._root, 1, None, None, True)
+        assert total == self._size, (total, self._size)
+        chain: List[_Leaf] = []
+        leaf, prev = self._leftmost(), None
+        while leaf is not None:
+            assert leaf.prev is prev
+            chain.append(leaf)
+            prev, leaf = leaf, leaf.next
+        assert len(chain) == len(leaves) and all(a is b for a, b in zip(chain, leaves))
